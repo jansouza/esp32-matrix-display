@@ -25,7 +25,7 @@
 #include <strings.h>     // strncasecmp(), used for case-insensitive header matching
 
 #define PRINT_CALLBACK  0
-#define DEBUG 0
+#define DEBUG 1
 #define LED_HEARTBEAT 0
 
 #if DEBUG
@@ -199,6 +199,34 @@ void expandIcons(char *szMesg)
   }
 
   *pWrite = '\0';
+}
+
+void collapseIcons(const char *szIn, char *szOut, uint16_t maxLen)
+// Inverse of expandIcons(): rewrite icon control bytes back into their
+// [tag] text form so a stored message can be shown and edited in the
+// web UI. Output is truncated (but always null-terminated) if the
+// expanded form does not fit in maxLen.
+{
+  uint16_t idx = 0;
+
+  for (; *szIn != '\0'; szIn++)
+  {
+    const icon_t *pIcon = findIconByCode(*szIn);
+
+    if (pIcon != NULL)
+    {
+      size_t len = strlen(pIcon->tag);
+      if (idx + len >= maxLen) break;
+      memcpy(&szOut[idx], pIcon->tag, len);
+      idx += len;
+    }
+    else
+    {
+      if (idx + 1 >= maxLen) break;
+      szOut[idx++] = *szIn;
+    }
+  }
+  szOut[idx] = '\0';
 }
 
 // Persistence (NVS via Preferences) --------------------------------
@@ -784,9 +812,9 @@ const char WebPage[] = \
 "  var request = new XMLHttpRequest();\n" \
 "  request.open(\"GET\", \"/&SETTINGS=1/&nocache=\" + Math.random(), true);\n" \
 "  request.onload = function(){\n" \
-"    // scrollDelay, brightness, displayMode\n" \
+"    // scrollDelay, brightness, displayMode, last message\n" \
 "    var parts = request.responseText.split(\",\");\n" \
-"    if (parts.length !== 3) return;\n" \
+"    if (parts.length < 3) return;\n" \
 "    var displayMode = parts[2];\n" \
 "\n" \
 "    document.getElementById(\"spd\").value = parts[0];\n" \
@@ -796,6 +824,13 @@ const char WebPage[] = \
 "\n" \
 "    var msgModeInput = document.querySelector(\"input[name=msgmode][value='\" + displayMode + \"']\");\n" \
 "    if (msgModeInput) msgModeInput.checked = true;\n" \
+"\n" \
+"    // Prefill the message box with the last message sent (the message\n" \
+"    // may contain commas, so rejoin everything after the 3rd field),\n" \
+"    // unless the user already started typing.\n" \
+"    var lastMsg = parts.slice(3).join(\",\");\n" \
+"    var msgEl = document.getElementById(\"Message\");\n" \
+"    if (lastMsg && !msgEl.value){ msgEl.value = lastMsg; updatePreview(); }\n" \
 "    if (next) next();\n" \
 "  };\n" \
 "  request.onerror = function(){ if (next) next(); };\n" \
@@ -845,7 +880,7 @@ boolean getParam(char *szMesg, const char *key, char *psz, uint8_t len)
 {
   boolean isValid = false;  // text received flag
   char *pStart, *pEnd;      // pointer to start and end of text
-  char szKey[10];
+  char szKey[16];           // must fit "/&" + longest key ("APIREGEN") + "=" + null
 
   sprintf(szKey, "/&%s=", key);
   pStart = strstr(szMesg, szKey);
@@ -861,7 +896,9 @@ boolean getParam(char *szMesg, const char *key, char *psz, uint8_t len)
 
     if (pEnd != NULL)
     {
-      while (pStart != pEnd)
+      uint8_t written = 0;
+
+      while ((pStart < pEnd) && (written + 1 < len))
       {
         if ((*pStart == '%') && isxdigit(*(pStart+1)))
         {
@@ -874,6 +911,7 @@ boolean getParam(char *szMesg, const char *key, char *psz, uint8_t len)
         }
         else
           *psz++ = *pStart++;
+        written++;
       }
 
       *psz = '\0'; // terminate the string
@@ -911,7 +949,7 @@ boolean getQueryParam(const char *szUrl, const char *key, char *psz, uint8_t len
       while ((*pEnd != '&') && (*pEnd != '\0') && (*pEnd != ' ') && (*pEnd != '\n')) pEnd++;
 
       uint8_t written = 0;
-      while ((pStart != pEnd) && (written + 1 < len))
+      while ((pStart < pEnd) && (written + 1 < len))
       {
         if ((*pStart == '%') && isxdigit(*(pStart + 1)) && isxdigit(*(pStart + 2)))
         {
@@ -960,7 +998,7 @@ boolean getHeader(const char *szReq, const char *headerName, char *psz, uint8_t 
       while ((*pEnd != '\n') && (*pEnd != '\0')) pEnd++;
 
       uint8_t written = 0;
-      while ((pStart != pEnd) && (written + 1 < len))
+      while ((pStart < pEnd) && (written + 1 < len))
       {
         *psz++ = *pStart++;
         written++;
@@ -976,7 +1014,8 @@ boolean getHeader(const char *szReq, const char *headerName, char *psz, uint8_t 
 void handleWiFi(void)
 {
   static enum { S_IDLE, S_WAIT_CONN, S_READ, S_EXTRACT, S_RESPONSE, S_DISCONN } state = S_IDLE;
-  static char szBuf[1024];
+  static char szBuf[2048];
+  static char lastCh = '\0';
   static uint16_t idxBuf = 0;
   static WiFiClient client;
   static uint32_t timeStart;
@@ -992,6 +1031,7 @@ void handleWiFi(void)
   case S_IDLE:   // initialize
     PRINTS("\nS_IDLE");
     idxBuf = 0;
+    lastCh = '\0';
     state = S_WAIT_CONN;
     break;
 
@@ -1008,6 +1048,7 @@ void handleWiFi(void)
 #endif
 
       timeStart = millis();
+      PRINTS("\nS_READ");
       state = S_READ;
     }
     break;
@@ -1016,15 +1057,17 @@ void handleWiFi(void)
     // that ends them. Headers are kept (as '\n'-separated lines within
     // szBuf) so S_EXTRACT can look up X-API-Key; getParam()/getQueryParam()
     // only ever match against the first line, so this is transparent to them.
-    PRINTS("\nS_READ");
     while (client.available() && (state == S_READ))
     {
       char c = client.read();
       if (c == '\r') continue;
       if (c == '\n')
       {
-        // Blank line (two consecutive '\n's) marks the end of the headers
-        if ((idxBuf > 0) && (szBuf[idxBuf - 1] == '\n'))
+        // Blank line (two consecutive '\n's) marks the end of the headers.
+        // Tracked in lastCh rather than szBuf so the end of the request is
+        // still detected even when the headers overflow the buffer and the
+        // extra characters (including '\n's) are being dropped.
+        if (lastCh == '\n')
         {
           state = S_EXTRACT;
         }
@@ -1034,13 +1077,14 @@ void handleWiFi(void)
       else if (idxBuf < sizeof(szBuf) - 1)
         szBuf[idxBuf++] = (char)c;
       // else: request too long for the buffer - silently drop extra characters
+      lastCh = c;
     }
     if (state == S_EXTRACT)
     {
       szBuf[idxBuf] = '\0';
       PRINT("\nRecv: ", szBuf);
     }
-    if ((state == S_READ) && (millis() - timeStart > 1000))
+    if ((state == S_READ) && (millis() - timeStart > 500))
     {
       PRINTS("\nWait timeout");
       state = S_DISCONN;
@@ -1222,8 +1266,16 @@ void handleWiFi(void)
     }
     else if (wantsSettings)
     {
-      char szSettings[16];
-      sprintf(szSettings, "%d,%d,%d", scrollDelay, brightness, displayMode);
+      // scrollDelay, brightness, displayMode, last saved message (icon
+      // control bytes collapsed back to [tag] form so it can be edited).
+      // The message goes last because it may itself contain commas - the
+      // UI rejoins everything after the third field.
+      char szSettings[MESG_SIZE * 7 + 16]; // worst case: every byte is a 7-char [tag]
+      char szLast[MESG_SIZE];
+
+      if (!loadLastMessage(szLast, sizeof(szLast))) szLast[0] = '\0';
+      sprintf(szSettings, "%d,%d,%d,", scrollDelay, brightness, displayMode);
+      collapseIcons(szLast, szSettings + strlen(szSettings), sizeof(szSettings) - strlen(szSettings));
       sendResponseHeader(client, strlen(szSettings), false);
       client.print(szSettings);
     }
