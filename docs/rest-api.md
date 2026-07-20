@@ -39,7 +39,7 @@ An unauthorized request returns HTTP 200 with:
 | `brt` | integer | 0 – 15 | Display brightness. 0 = minimum, 15 = maximum. Saved to NVS (unless sent with `alert`). |
 | `mode` | integer | `0` / `1` / `2` | Message sub-mode: `0` = scroll, `1` = static with blink, `2` = blink+scroll. Saved to NVS (unless sent with `alert`). |
 | `alert` | integer | 1 – 3600 | Show `msg` for N seconds, then automatically restore the previous state (mode, message, brightness, speed). Requires `msg`. Settings sent along with `alert` are also temporary. |
-| `display` | string | `clock` / `message` | Switches the top-level display mode. `message` shows the current message; `clock` shows the NTP clock. Saved to NVS. |
+| `display` | string | `clock` / `life` (or `gol`) / `message` | Switches the top-level display mode. `message` shows the current message; `clock` shows the NTP clock; `life`/`gol` shows an evolving Conway's Game of Life board. Saved to NVS. |
 | `tz` | integer | -720 – 840 | Timezone as a UTC offset in **minutes** (e.g. `-180` for UTC-3, `60` for UTC+1, `330` for UTC+5:30). Saved to NVS. |
 | `date` | integer | `0` / `1` | Clock mode only. `1` = periodically show the date (`DD/MM`) for a few seconds. Saved to NVS. |
 | `dateint` | integer | 5 – 3600 | Clock mode only. How often (in seconds) to show the date. Requires `date=1`. Saved to NVS. |
@@ -186,6 +186,15 @@ curl -H "X-API-Key: <key>" \
   "http://192.168.1.50/api/display?display=clock&tz=-180&date=1&dateint=60"
 ```
 
+### Switch to Game of Life mode
+
+```bash
+curl -H "X-API-Key: <key>" \
+  "http://192.168.1.50/api/display?display=life"
+```
+
+`display=gol` is accepted as an alias for `display=life`. The board is reseeded with a fresh random pattern every time Life mode is entered, and automatically reseeds itself when it becomes stuck (a still life or a short-period oscillator).
+
 ### Switch back to message mode
 
 ```bash
@@ -219,7 +228,7 @@ curl -g -H "X-API-Key: <key>" \
 ## Behaviour notes
 
 - **Persistence**: `spd`, `brt`, `mode`, `display`, `tz`, `date`, and `dateint` are saved to NVS and survive reboots, **except** when sent as part of an `alert` request (those are temporary).
-- **`msg` auto-switches mode**: sending `msg` without `display=clock` always switches the device to Message mode. You do not need to send `display=message` explicitly.
+- **`msg` auto-switches mode**: sending `msg` without an explicit `display=` always switches the device to Message mode. You do not need to send `display=message` explicitly.
 - **Clock requires NTP**: the NTP client only runs in station mode (not in the setup AP). Until the first NTP sync, the clock shows `--:--`.
 - **Timezone granularity**: `tz` accepts any integer in minutes, so half-hour offsets such as UTC+5:30 (`tz=330`) and UTC+9:30 (`tz=570`) are fully supported.
 - **No rate limit**: requests are handled cooperatively from `loop()`; sending many requests in rapid succession may cause brief display glitches.

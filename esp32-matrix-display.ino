@@ -96,6 +96,7 @@ const uint32_t BLINK_PHASE_MS  = 5000; // blink+scroll mode: blink this long bet
 // clock instead.
 #define APP_MODE_MESSAGE 0
 #define APP_MODE_CLOCK   1
+#define APP_MODE_LIFE    2
 const uint8_t DEFAULT_APP_MODE = APP_MODE_MESSAGE;
 
 // Clock mode configuration
@@ -109,6 +110,12 @@ const uint16_t DEFAULT_DATE_EVERY_S = 30;     // show the date every this many s
 const uint16_t MIN_DATE_EVERY_S = 5;
 const uint16_t MAX_DATE_EVERY_S = 3600;
 #define CLOCK_DATE_SHOW_S 3    // how long the date stays on screen
+
+// Game of Life mode configuration
+const uint16_t GOL_TICK_MS = 200;           // ms between generations (fixed for v1)
+const uint8_t  GOL_STAGNANT_LIMIT = 8;      // generations with no visible change before reseeding
+const uint16_t GOL_REVIVE_DENSITY_PCT = 35; // percent of cells alive on reseed
+const uint16_t GOL_BLANK_PAUSE_MS = 400;    // blank pause shown before a reseed
 
 char curMessage[MESG_SIZE];
 char newMessage[MESG_SIZE];
@@ -280,7 +287,7 @@ void loadSettings(void)
   brightness  = prefs.getUChar("brt", DEFAULT_BRIGHTNESS);
   displayMode = prefs.getUChar("mode", DEFAULT_MODE);
   appMode     = prefs.getUChar("amode", DEFAULT_APP_MODE);
-  if (appMode > APP_MODE_CLOCK) appMode = DEFAULT_APP_MODE;
+  if (appMode > APP_MODE_LIFE) appMode = DEFAULT_APP_MODE;
   tzOffsetMin = prefs.getShort("tzofs", DEFAULT_TZ_OFFSET_MIN);
   tzOffsetMin = constrain(tzOffsetMin, MIN_TZ_OFFSET_MIN, MAX_TZ_OFFSET_MIN);
   dateEnabled = prefs.getBool("dateon", DEFAULT_DATE_ENABLED);
@@ -319,6 +326,11 @@ void setAppMode(uint8_t v)
   resetScrollSource();
   if (appMode == APP_MODE_CLOCK)
     clockForceRedraw();
+  else if (appMode == APP_MODE_LIFE)
+  {
+    golSeed();
+    golForceRedraw();
+  }
   else if (displayMode == 0)
     newMessageAvailable = true;  // restart scrolling from the last message
   else if (displayMode == 1)
@@ -609,6 +621,7 @@ const char WebPage[] = \
 "      <div class=\"modes\">\n" \
 "        <label><input type=\"radio\" name=\"appmode\" value=\"0\" checked onchange=\"onAppModeChange()\"><span>Message</span></label>\n" \
 "        <label><input type=\"radio\" name=\"appmode\" value=\"1\" onchange=\"onAppModeChange()\"><span>Clock</span></label>\n" \
+"        <label><input type=\"radio\" name=\"appmode\" value=\"2\" onchange=\"onAppModeChange()\"><span>Game of Life</span></label>\n" \
 "      </div>\n" \
 "    </div>\n" \
 "\n" \
@@ -764,11 +777,14 @@ const char WebPage[] = \
 "}\n" \
 "\n" \
 "function updateModeUI(){\n" \
-"  var clock = currentAppMode() === \"1\";\n" \
+"  var mode = currentAppMode();\n" \
+"  var clock = mode === \"1\";\n" \
+"  var life = mode === \"2\";\n" \
+"  var msgMode = !clock && !life;\n" \
 "  var dateOn = document.getElementById(\"dateOn\").checked;\n" \
-"  document.getElementById(\"msgCard\").style.display = clock ? \"none\" : \"block\";\n" \
-"  document.getElementById(\"spdRow\").style.display = clock ? \"none\" : \"flex\";\n" \
-"  document.getElementById(\"msgModes\").style.display = clock ? \"none\" : \"flex\";\n" \
+"  document.getElementById(\"msgCard\").style.display = msgMode ? \"block\" : \"none\";\n" \
+"  document.getElementById(\"spdRow\").style.display = msgMode ? \"flex\" : \"none\";\n" \
+"  document.getElementById(\"msgModes\").style.display = msgMode ? \"flex\" : \"none\";\n" \
 "  document.getElementById(\"tzRow\").style.display = clock ? \"flex\" : \"none\";\n" \
 "  document.getElementById(\"dateRow\").style.display = clock ? \"flex\" : \"none\";\n" \
 "  document.getElementById(\"dateIvRow\").style.display = (clock && dateOn) ? \"flex\" : \"none\";\n" \
@@ -1345,14 +1361,16 @@ void handleWiFi(void)
           uint16_t v = (uint16_t)constrain(atoi(szParam), MIN_DATE_EVERY_S, MAX_DATE_EVERY_S);
           if (v != dateEveryS) { dateEveryS = v; settingsChanged = true; }
         }
-        // Top-level mode: ?display=clock|message. Sending a message
-        // without an explicit display= also switches back to message
-        // mode, so a plain ?msg=... always ends up visible.
+        // Top-level mode: ?display=clock|life|gol|message. Sending a
+        // message without an explicit display= also switches back to
+        // message mode, so a plain ?msg=... always ends up visible.
         {
           uint8_t v = appMode;
           if (getQueryParam(szBuf, "display", szParam, sizeof(szParam)))
           {
-            v = (strcmp(szParam, "clock") == 0) ? APP_MODE_CLOCK : APP_MODE_MESSAGE;
+            if (strcmp(szParam, "clock") == 0) v = APP_MODE_CLOCK;
+            else if (strcmp(szParam, "life") == 0 || strcmp(szParam, "gol") == 0) v = APP_MODE_LIFE;
+            else v = APP_MODE_MESSAGE;
             if (apiAlertSecs == 0) alertActive = false;  // explicit mode change wins over a pending revert
           }
           else if (apiMessageOk)
@@ -1411,7 +1429,7 @@ void handleWiFi(void)
       }
       if (getParam(szBuf, "DMODE", szParam, sizeof(szParam)))
       {
-        uint8_t v = (uint8_t)constrain(atoi(szParam), APP_MODE_MESSAGE, APP_MODE_CLOCK);
+        uint8_t v = (uint8_t)constrain(atoi(szParam), APP_MODE_MESSAGE, APP_MODE_LIFE);
         alertActive = false;  // explicit mode choice from the UI wins over a pending revert
         if (v != appMode)
         {
@@ -1989,6 +2007,156 @@ void clockTick(void)
   }
 }
 
+// Game of Life mode --------------------------------------------------
+// Direct-draw mode like the clock: a 32x8 pixel board (one byte per
+// column, bit0=top row..bit7=bottom row, same convention as iconTable
+// and drawClockGlyph) evolved with the classic B3/S23 rule on a
+// toroidal (wrap-around) topology and redrawn in full each generation.
+
+uint8_t golGrid[MAX_DEVICES * COL_SIZE];
+uint8_t golNextGrid[MAX_DEVICES * COL_SIZE];
+
+bool golRedrawPending = false;
+uint8_t golStagnantCount = 0;
+uint32_t golPopHistory[4];   // checksums of the last up to 4 generations, for cycle detection
+uint8_t golHistoryLen = 0;
+bool golPendingReseed = false;
+uint32_t golBlankUntil = 0;
+
+void golSeed(void)
+// Fill the board with a fresh random pattern and clear stagnation state.
+{
+  for (uint8_t col = 0; col < MAX_DEVICES * COL_SIZE; col++)
+  {
+    uint8_t colBits = 0;
+    for (uint8_t row = 0; row < 8; row++)
+      if ((esp_random() % 100) < GOL_REVIVE_DENSITY_PCT) colBits |= (1 << row);
+    golGrid[col] = colBits;
+  }
+  golStagnantCount = 0;
+  golHistoryLen = 0;
+}
+
+bool golCellAt(const uint8_t *grid, int8_t col, int8_t row)
+// Toroidal (wrap-around) cell lookup.
+{
+  col = ((col % (MAX_DEVICES * COL_SIZE)) + (MAX_DEVICES * COL_SIZE)) % (MAX_DEVICES * COL_SIZE);
+  row = ((row % 8) + 8) % 8;
+  return (grid[col] & (1 << row)) != 0;
+}
+
+uint8_t golCountNeighbors(const uint8_t *grid, int8_t col, int8_t row)
+{
+  uint8_t n = 0;
+  for (int8_t dc = -1; dc <= 1; dc++)
+    for (int8_t dr = -1; dr <= 1; dr++)
+    {
+      if (dc == 0 && dr == 0) continue;
+      if (golCellAt(grid, col + dc, row + dr)) n++;
+    }
+  return n;
+}
+
+bool golStep(void)
+// Advance the board by one generation (B3/S23). Returns true if any
+// cell changed, false if the new generation is identical to the last
+// (still life or extinction).
+{
+  bool changed = false;
+
+  for (uint8_t col = 0; col < MAX_DEVICES * COL_SIZE; col++)
+  {
+    uint8_t colBits = 0;
+    for (uint8_t row = 0; row < 8; row++)
+    {
+      uint8_t n = golCountNeighbors(golGrid, col, row);
+      bool alive = golCellAt(golGrid, col, row);
+      bool next = alive ? (n == 2 || n == 3) : (n == 3);
+      if (next) colBits |= (1 << row);
+    }
+    if (colBits != golGrid[col]) changed = true;
+    golNextGrid[col] = colBits;
+  }
+  memcpy(golGrid, golNextGrid, sizeof(golGrid));
+  return changed;
+}
+
+uint32_t golChecksum(void)
+// Cheap FNV-1a style hash of the board, used for short-cycle detection.
+{
+  uint32_t hash = 2166136261u;
+  for (uint8_t col = 0; col < MAX_DEVICES * COL_SIZE; col++)
+  {
+    hash ^= golGrid[col];
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+void drawGolFrame(void)
+{
+  mx.clear();
+  for (uint16_t col = 0; col < MAX_DEVICES * COL_SIZE; col++)
+    mx.setColumn(col, golGrid[col]);
+}
+
+void golForceRedraw(void)
+// Called when the device switches into Life mode so the next golTick()
+// paints the freshly seeded board immediately instead of waiting for
+// the next generation tick.
+{
+  golRedrawPending = true;
+}
+
+void golTick(void)
+// Non-blocking Game of Life renderer, called from loop() while in Life
+// mode. Advances one generation every GOL_TICK_MS; reseeds (with a
+// brief blank pause) once the board has been stagnant - unchanged or
+// cycling with period <= 4 - for GOL_STAGNANT_LIMIT generations.
+{
+  static uint32_t prevTick = 0;
+
+  if (golPendingReseed && (millis() >= golBlankUntil))
+  {
+    golSeed();
+    golPendingReseed = false;
+    golRedrawPending = true;
+  }
+
+  if (!golRedrawPending && (millis() - prevTick < GOL_TICK_MS)) return;
+  prevTick = millis();
+
+  if (golRedrawPending)
+  {
+    drawGolFrame();
+    golRedrawPending = false;
+    return;
+  }
+
+  bool changed = golStep();
+  uint32_t checksum = golChecksum();
+  bool cyclic = false;
+  for (uint8_t i = 0; i < golHistoryLen; i++)
+    if (golPopHistory[i] == checksum) cyclic = true;
+
+  if (!changed || cyclic)
+    golStagnantCount++;
+  else
+    golStagnantCount = 0;
+
+  golPopHistory[golHistoryLen % 4] = checksum;
+  if (golHistoryLen < 4) golHistoryLen++;
+
+  drawGolFrame();
+
+  if (golStagnantCount >= GOL_STAGNANT_LIMIT)
+  {
+    mx.clear();
+    golBlankUntil = millis() + GOL_BLANK_PAUSE_MS;
+    golPendingReseed = true;
+  }
+}
+
 void scrollText(void)
 {
   static uint32_t	prevTime = 0;
@@ -2059,6 +2227,7 @@ void setup(void)
   PRINT("\nStartup message ", curMessage);
 
   if (appMode == APP_MODE_CLOCK) clockForceRedraw();  // paint the clock right away
+  else if (appMode == APP_MODE_LIFE) { golSeed(); golForceRedraw(); }  // seed the board
   else if (displayMode == 1) showStatic();            // static mode: render immediately
   else if (displayMode == 2) resetBlinkScroll();      // blink+scroll renders on the first loop()
 }
@@ -2098,6 +2267,8 @@ void loop(void)
   handleWiFi();
   if (appMode == APP_MODE_CLOCK)
     clockTick();
+  else if (appMode == APP_MODE_LIFE)
+    golTick();
   else if (displayMode == 0)
     scrollText();
   else if (displayMode == 2)

@@ -3,17 +3,21 @@
 Firmware for ESP32 that controls an LED matrix (MAX7219/MAX72XX, via
 [MD_MAX72XX](https://github.com/MajicDesigns/MD_MAX72XX)) and turns it into a
 WiFi-connected scrolling display, controllable via a web interface and a simple
-REST API. Works as a message board or as an NTP clock.
+REST API. Works as a message board, an NTP clock, or a Conway's Game of Life
+display.
 
 ## Features
 
-- **Two modes**: **Message** (scrolling/blinking text) or **Clock** (NTP),
-  selectable in the web interface.
+- **Three modes**: **Message** (scrolling/blinking text), **Clock** (NTP), or
+  **Game of Life**, selectable in the web interface.
 - **Clock mode (NTP)**: time in `HH:MM` with a blinking colon and small
   seconds digits, plus an optional date display (`DD/MM`) shown for a few
   seconds at a configurable interval. Timezone (UTC offset, half-hour
   steps supported), date on/off and interval are all configurable in the
   web interface — no reboot needed.
+- **Game of Life mode**: Conway's Game of Life evolving on the full matrix
+  (wrap-around board), automatically reseeding with a fresh random pattern
+  whenever it settles into a still life or a short repeating cycle.
 - **Web interface** to type and send scrolling messages to the display;
   the message box comes prefilled with the last message sent.
 - **REST API** (`GET /api/display?msg=...`) to send messages and control the display programmatically — see the [API reference](docs/api.md).
@@ -85,6 +89,12 @@ with its interval in seconds. Changes apply without rebooting.
 
 ![Web interface - Clock mode](assets/screenshot_1.png)
 
+### Game of Life mode
+
+Switch the mode to **Game of Life** to let Conway's Game of Life run on the
+matrix. No settings to configure — the board seeds itself with a random
+pattern on entry and reseeds automatically whenever it stalls.
+
 ### Network and API tabs
 
 - **Network**: shows the current connection (SSID, IP, signal) and lets you
@@ -102,7 +112,7 @@ curl "http://192.168.1.50/api/display?msg=Hello%20World"
 ```
 
 Available parameters: `msg`, `spd`, `brt`, `mode` (scroll / blink /
-blink+scroll), `alert`, `display` (message / clock), `tz`, `date`,
+blink+scroll), `alert`, `display` (message / clock / life), `tz`, `date`,
 `dateint`. Authentication via the `X-API-Key` header is optional and
 managed in the web interface.
 
@@ -124,6 +134,7 @@ settings (WiFi, brightness, speed, API key) and return to factory defaults.
 ## Roadmap
 
 - [x] Clock mode (NTP)
+- [x] Game of Life mode
 - [ ] Additional widgets/display modes
 
 ## License
