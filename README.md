@@ -122,9 +122,9 @@ plenty of curl examples.
 
 ## Integrations
 
-- **[Home Assistant](docs/home-assistant.md)** — use the display as a
-  notification target (`notify`) or with full parameter control
-  (`rest_command`), with ready-to-use automation examples.
+- **[Home Assistant](docs/home-assistant.md)** — control the display with
+  full parameter access via `rest_command`, with ready-to-use automation
+  examples.
 
 ## Factory Reset
 
@@ -136,6 +136,7 @@ settings (WiFi, brightness, speed, API key) and return to factory defaults.
 - [x] Clock mode (NTP)
 - [x] Game of Life mode
 - [ ] Additional widgets/display modes
+- [ ] Distribution via [ESP Web Tools](https://esphome.github.io/esp-web-tools/) (browser-based flashing, no Arduino IDE required)
 
 ## License
 
