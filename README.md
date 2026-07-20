@@ -3,23 +3,32 @@
 Firmware for ESP32 that controls an LED matrix (MAX7219/MAX72XX, via
 [MD_MAX72XX](https://github.com/MajicDesigns/MD_MAX72XX)) and turns it into a
 WiFi-connected scrolling display, controllable via a web interface and a simple
-REST API. Designed to grow beyond text messages — next steps include a clock
-mode and other widgets.
+REST API. Works as a message board or as an NTP clock.
 
 ## Features
 
+- **Two modes**: **Message** (scrolling/blinking text) or **Clock** (NTP),
+  selectable in the web interface.
+- **Clock mode (NTP)**: time in `HH:MM` with a blinking colon and small
+  seconds digits, plus an optional date display (`DD/MM`) shown for a few
+  seconds at a configurable interval. Timezone (UTC offset, half-hour
+  steps supported), date on/off and interval are all configurable in the
+  web interface — no reboot needed.
 - **Web interface** to type and send scrolling messages to the display;
   the message box comes prefilled with the last message sent.
-- **REST API** (`GET /api/message?msg=...`) to send messages programmatically.
+- **REST API** (`GET /api/display?msg=...`) to send messages and control the display programmatically — see the [API reference](docs/api.md).
 - **Optional API key authentication** (`X-API-Key` header), generated and managed via the web interface.
 - **WiFi setup portal**: if the configured network is not found, the device
   starts an Access Point (`MD-Display-Setup`) so you can configure the
   SSID/password from your browser.
-- **Persistent settings** (scroll speed, brightness, display mode) saved to
-  NVS via `Preferences`, surviving reboots.
+- **Persistent settings** (mode, timezone, scroll speed, brightness, display
+  mode) saved to NVS via `Preferences`, surviving reboots.
 - **Built-in custom icons** inserted into messages with tags such as
   `[heart]`, `[wifi]`, `[smile]`, `[clock]`, `[star]`, and others.
 - **Static mode with blink**, in addition to the default scroll mode.
+- **Blink+Scroll mode**: blinks the visible part of the message for a few
+  seconds, then scrolls once through the rest; messages that fit the
+  display just blink.
 - **Factory reset**: hold the BOOT button while powering on/resetting to erase
   all saved settings and credentials.
 
@@ -55,53 +64,57 @@ Pins can be adjusted at the top of the `.ino` file (`CLK_PIN`, `DATA_PIN`, `CS_P
 4. Once connected, the display shows the assigned IP — open it in your browser
    to send messages, adjust brightness/speed, and manage the API key.
 
+## Web Interface
+
+Open the device IP in your browser to access the control panel. It has three
+tabs: **Settings**, **Network**, and **API**.
+
+### Message mode
+
+Type the message (with live preview), insert icons with one click, and adjust
+scroll speed, brightness, and the display mode (**Scroll**, **Blink**, or
+**Blink+Scroll**). The message box comes prefilled with the last message sent.
+
+![Web interface - Message mode](assets/screenshot_2.png)
+
+### Clock mode
+
+Switch the mode to **Clock** to show the NTP time. Here you configure the
+timezone (UTC offset), brightness, and the optional date display (`DD/MM`)
+with its interval in seconds. Changes apply without rebooting.
+
+![Web interface - Clock mode](assets/screenshot_1.png)
+
+### Network and API tabs
+
+- **Network**: shows the current connection (SSID, IP, signal) and lets you
+  change the WiFi credentials — saving reboots the device.
+- **API**: enables/disables API key authentication and generates/regenerates
+  the key used in the `X-API-Key` header.
+
 ## REST API
 
-```
-GET /api/message?msg=Hello%20World
-```
-
-Optional parameters: `spd` (scroll speed, 20–250 ms), `brt` (brightness,
-0–15), and `mode` (`0` = scroll, `1` = static with blink). Icon tags like
-`[heart]` work normally in the message.
-
-### curl Examples
-
-Send a message (no authentication):
+A single endpoint controls everything — message, speed, brightness, modes,
+clock settings and temporary alerts:
 
 ```bash
-curl "http://192.168.1.50/api/message?msg=Hello%20World"
+curl "http://192.168.1.50/api/display?msg=Hello%20World"
 ```
 
-With authentication enabled, send the API key (generated in the **API** tab of
-the web interface) via the `X-API-Key` header:
+Available parameters: `msg`, `spd`, `brt`, `mode` (scroll / blink /
+blink+scroll), `alert`, `display` (message / clock), `tz`, `date`,
+`dateint`. Authentication via the `X-API-Key` header is optional and
+managed in the web interface.
 
-```bash
-curl -g -H "X-API-Key: 3f8a1c9b2e7d4f60a5b8c1d2" \
-  "http://192.168.1.50/api/message?msg=Temperature%2023C%20[sun]"
-```
+See the **[REST API reference](docs/rest-api.md)** for the full parameter
+table, authentication, icon tags, JSON responses, behaviour notes, and
+plenty of curl examples.
 
-> The `-g` (`--globoff`) flag is required when the message contains icon tags:
-> without it, curl interprets `[` and `]` as range syntax and fails with
-> `bad range in URL`. Alternative: URL-encode the brackets (`%5Bsun%5D`).
+## Integrations
 
-Adjusting speed, brightness, and mode as well:
-
-```bash
-curl -H "X-API-Key: 3f8a1c9b2e7d4f60a5b8c1d2" \
-  "http://192.168.1.50/api/message?msg=Alert!&spd=40&brt=15&mode=1"
-```
-
-JSON responses:
-
-```json
-{"ok":true,"msg":"Hello World"}
-{"ok":false,"error":"missing msg parameter"}
-{"ok":false,"error":"unauthorized"}
-```
-
-> Replace `192.168.1.50` with the IP shown on the display and the example key
-> with yours, displayed in the web interface.
+- **[Home Assistant](docs/home-assistant.md)** — use the display as a
+  notification target (`notify`) or with full parameter control
+  (`rest_command`), with ready-to-use automation examples.
 
 ## Factory Reset
 
@@ -110,7 +123,7 @@ settings (WiFi, brightness, speed, API key) and return to factory defaults.
 
 ## Roadmap
 
-- [ ] Clock mode (NTP)
+- [x] Clock mode (NTP)
 - [ ] Additional widgets/display modes
 
 ## License

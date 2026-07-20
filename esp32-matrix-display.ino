@@ -23,6 +23,7 @@
 #include <Preferences.h>
 #include <esp_system.h>  // esp_random(), used to generate the REST API key
 #include <strings.h>     // strncasecmp(), used for case-insensitive header matching
+#include <time.h>        // NTP clock mode (configTime/getLocalTime)
 
 #define PRINT_CALLBACK  0
 #define DEBUG 1
@@ -83,11 +84,31 @@ const uint8_t CHAR_SPACING = 1;
 // Defaults used the first time the device boots (no saved preferences yet)
 const uint8_t DEFAULT_SCROLL_DELAY = 75;  // ms between scroll steps
 const uint8_t DEFAULT_BRIGHTNESS   = 8;   // 0..MAX_INTENSITY (15)
-const uint8_t DEFAULT_MODE         = 0;   // 0 = scroll, 1 = static blink
+const uint8_t DEFAULT_MODE         = 0;   // 0 = scroll, 1 = static blink, 2 = blink+scroll
 
 const uint8_t MIN_SCROLL_DELAY = 20;
 const uint8_t MAX_SCROLL_DELAY = 250;
-const uint16_t BLINK_INTERVAL  = 500; // ms, static blink mode on/off period
+const uint16_t BLINK_INTERVAL  = 500;  // ms, static blink mode on/off period
+const uint32_t BLINK_PHASE_MS  = 5000; // blink+scroll mode: blink this long between scroll passes
+
+// Top-level device mode: what the display shows. Message mode keeps the
+// scroll/blink sub-modes above (displayMode); clock mode shows an NTP
+// clock instead.
+#define APP_MODE_MESSAGE 0
+#define APP_MODE_CLOCK   1
+const uint8_t DEFAULT_APP_MODE = APP_MODE_MESSAGE;
+
+// Clock mode configuration
+const int16_t DEFAULT_TZ_OFFSET_MIN = -180;    // UTC-3 (Brasilia)
+const int16_t MIN_TZ_OFFSET_MIN = -720;        // UTC-12
+const int16_t MAX_TZ_OFFSET_MIN = 840;         // UTC+14
+const char *NTP_SERVER_1 = "pool.ntp.org";
+const char *NTP_SERVER_2 = "time.nist.gov";
+const bool DEFAULT_DATE_ENABLED = true;       // periodically show the date
+const uint16_t DEFAULT_DATE_EVERY_S = 30;     // show the date every this many seconds
+const uint16_t MIN_DATE_EVERY_S = 5;
+const uint16_t MAX_DATE_EVERY_S = 3600;
+#define CLOCK_DATE_SHOW_S 3    // how long the date stays on screen
 
 char curMessage[MESG_SIZE];
 char newMessage[MESG_SIZE];
@@ -98,8 +119,23 @@ Preferences prefs;
 uint8_t scrollDelay = DEFAULT_SCROLL_DELAY;
 uint8_t brightness  = DEFAULT_BRIGHTNESS;
 uint8_t displayMode = DEFAULT_MODE;
+uint8_t appMode     = DEFAULT_APP_MODE;
+int16_t tzOffsetMin = DEFAULT_TZ_OFFSET_MIN;
+bool dateEnabled    = DEFAULT_DATE_ENABLED;
+uint16_t dateEveryS = DEFAULT_DATE_EVERY_S;
 
-// REST API (/api/message) authentication - off by default so the API
+// Temporary alert message (?msg=...&alert=<seconds> on the REST API):
+// snapshot of the display state to restore when the alert expires,
+// checked in loop() like the deferred restart. Never persisted to NVS.
+bool alertActive = false;
+uint32_t alertRevertTime = 0;         // millis() deadline for the revert
+uint8_t alertPrevAppMode = DEFAULT_APP_MODE;
+uint8_t alertPrevDisplayMode = DEFAULT_MODE;
+uint8_t alertPrevScrollDelay = DEFAULT_SCROLL_DELAY;
+uint8_t alertPrevBrightness = DEFAULT_BRIGHTNESS;
+char alertPrevMessage[MESG_SIZE];
+
+// REST API (/api/display) authentication - off by default so the API
 // works out of the box; the web UI lets the user enable it and generate
 // a key, which callers must then send as an "X-API-Key" header.
 const uint8_t API_KEY_LEN = 24;  // characters, not counting the null terminator
@@ -128,6 +164,9 @@ char apiKey[API_KEY_LEN + 1] = "";
 #define ICON_RAIN   '\x0f'
 #define ICON_PIN    '\x10'
 #define ICON_PLUS   '\x11'
+#define ICON_WARN   '\x12'
+#define ICON_BOLT   '\x13'
+#define ICON_FIRE   '\x14'
 
 typedef struct
 {
@@ -141,21 +180,24 @@ const icon_t iconTable[] =
 {
   { "[heart]", ICON_HEART, 8, { 0x0c, 0x1e, 0x3e, 0x7c, 0x7c, 0x3e, 0x1e, 0x0c } },
   { "[wifi]",  ICON_WIFI,  8, { 0x08, 0x04, 0x1a, 0xaa, 0xaa, 0x1a, 0x04, 0x08 } },
-  { "[smile]", ICON_SMILE, 8, { 0x3c, 0x42, 0x95, 0x81, 0xa5, 0x99, 0x42, 0x3c } },
+  { "[smile]", ICON_SMILE, 8, { 0x3c, 0x42, 0x95, 0xa1, 0xa1, 0x95, 0x42, 0x3c } },
   { "[up]",    ICON_UP,    8, { 0x08, 0x0c, 0x0e, 0x7f, 0x7f, 0x0e, 0x0c, 0x08 } },
   { "[down]",  ICON_DOWN,  8, { 0x10, 0x30, 0x70, 0xfe, 0xfe, 0x70, 0x30, 0x10 } },
   { "[left]",  ICON_LEFT,  8, { 0x08, 0x1c, 0x3e, 0x7f, 0x1c, 0x1c, 0x1c, 0x1c } },
   { "[right]", ICON_RIGHT, 8, { 0x1c, 0x1c, 0x1c, 0x1c, 0x7f, 0x3e, 0x1c, 0x08 } },
   { "[star]",  ICON_STAR,  8, { 0x18, 0x1c, 0x7e, 0x3c, 0x3c, 0x7e, 0x1c, 0x18 } },
   { "[music]", ICON_MUSIC, 6, { 0x60, 0x90, 0x90, 0x50, 0x60, 0x3f, 0x00, 0x00 } },
-  { "[bell]",  ICON_BELL,  8, { 0x10, 0x38, 0x38, 0x38, 0x7c, 0xfe, 0x10, 0x00 } },
-  { "[clock]", ICON_CLOCK, 8, { 0x3c, 0x42, 0x91, 0x95, 0x91, 0x81, 0x42, 0x3c } },
-  { "[ok]",    ICON_OK,    8, { 0x01, 0x03, 0x06, 0x8c, 0xd8, 0x70, 0x20, 0x00 } },
+  { "[bell]",  ICON_BELL,  7, { 0x20, 0x30, 0x3e, 0x7f, 0x3e, 0x30, 0x20, 0x00 } },
+  { "[clock]", ICON_CLOCK, 8, { 0x3c, 0x42, 0x91, 0x9d, 0x91, 0x81, 0x42, 0x3c } },
+  { "[ok]",    ICON_OK,    8, { 0x18, 0x30, 0x60, 0x30, 0x18, 0x0c, 0x06, 0x03 } },
   { "[x]",     ICON_X,     8, { 0x42, 0x66, 0x3c, 0x18, 0x18, 0x3c, 0x66, 0x42 } },
   { "[sun]",   ICON_SUN,   8, { 0x24, 0x18, 0x5a, 0x3c, 0x3c, 0x5a, 0x18, 0x24 } },
-  { "[rain]",  ICON_RAIN,  8, { 0x60, 0x3c, 0x7e, 0x3c, 0x00, 0x28, 0x50, 0x00 } },
-  { "[pin]",   ICON_PIN,   6, { 0x38, 0x7c, 0xfe, 0x7c, 0x38, 0x10, 0x00, 0x00 } },
+  { "[rain]",  ICON_RAIN,  6, { 0x45, 0x2f, 0x4e, 0x2e, 0x0e, 0x04, 0x00, 0x00 } },
+  { "[pin]",   ICON_PIN,   7, { 0x04, 0x0e, 0x1f, 0x3f, 0x1f, 0x0e, 0x04, 0x00 } },
   { "[plus]",  ICON_PLUS,  6, { 0x18, 0x18, 0x7e, 0x7e, 0x18, 0x18, 0x00, 0x00 } },
+  { "[warn]",  ICON_WARN,  7, { 0x60, 0x58, 0x46, 0x6d, 0x46, 0x58, 0x60, 0x00 } },
+  { "[bolt]",  ICON_BOLT,  5, { 0x68, 0x3c, 0x1e, 0x0f, 0x05, 0x00, 0x00, 0x00 } },
+  { "[fire]",  ICON_FIRE,  5, { 0x38, 0x7c, 0x5f, 0x7e, 0x38, 0x00, 0x00, 0x00 } },
 };
 
 const uint8_t ICON_TABLE_SIZE = sizeof(iconTable) / sizeof(iconTable[0]);
@@ -237,6 +279,13 @@ void loadSettings(void)
   scrollDelay = prefs.getUChar("spd", DEFAULT_SCROLL_DELAY);
   brightness  = prefs.getUChar("brt", DEFAULT_BRIGHTNESS);
   displayMode = prefs.getUChar("mode", DEFAULT_MODE);
+  appMode     = prefs.getUChar("amode", DEFAULT_APP_MODE);
+  if (appMode > APP_MODE_CLOCK) appMode = DEFAULT_APP_MODE;
+  tzOffsetMin = prefs.getShort("tzofs", DEFAULT_TZ_OFFSET_MIN);
+  tzOffsetMin = constrain(tzOffsetMin, MIN_TZ_OFFSET_MIN, MAX_TZ_OFFSET_MIN);
+  dateEnabled = prefs.getBool("dateon", DEFAULT_DATE_ENABLED);
+  dateEveryS  = prefs.getUShort("dateiv", DEFAULT_DATE_EVERY_S);
+  dateEveryS  = constrain(dateEveryS, MIN_DATE_EVERY_S, MAX_DATE_EVERY_S);
   apiAuthEnabled = prefs.getBool("apiauth", false);
   prefs.getString("apikey", apiKey, sizeof(apiKey));
 }
@@ -246,6 +295,36 @@ void saveSettings(void)
   prefs.putUChar("spd", scrollDelay);
   prefs.putUChar("brt", brightness);
   prefs.putUChar("mode", displayMode);
+  prefs.putUChar("amode", appMode);
+  prefs.putShort("tzofs", tzOffsetMin);
+  prefs.putBool("dateon", dateEnabled);
+  prefs.putUShort("dateiv", dateEveryS);
+}
+
+void applyTimeConfig(void)
+// (Re)start SNTP with the configured UTC offset. Non-blocking: the ESP32
+// SNTP client syncs in the background; until then getLocalTime() fails
+// and the clock face shows "--:--".
+{
+  configTime((long)tzOffsetMin * 60, 0, NTP_SERVER_1, NTP_SERVER_2);
+}
+
+void setAppMode(uint8_t v)
+// Switch between the top-level Message and Clock modes, restoring the
+// display state the new mode expects (blink mode may have left the
+// matrix shut down, scroll mode needs its state machine reset).
+{
+  appMode = v;
+  mx.control(MD_MAX72XX::SHUTDOWN, MD_MAX72XX::OFF);
+  resetScrollSource();
+  if (appMode == APP_MODE_CLOCK)
+    clockForceRedraw();
+  else if (displayMode == 0)
+    newMessageAvailable = true;  // restart scrolling from the last message
+  else if (displayMode == 1)
+    showStatic();                // redraw immediately in static/blink mode
+  else
+    resetBlinkScroll();          // restart blink+scroll from its blink phase
 }
 
 void generateApiKey(void)
@@ -381,7 +460,7 @@ const char WebPage[] = \
 "<!DOCTYPE html>\n" \
 "<html>\n" \
 "<head>\n" \
-"<title>MD_MAX72xx Control Panel</title>\n" \
+"<title>ESP32 Matrix Display</title>\n" \
 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" \
 "<style>\n" \
 "  :root{\n" \
@@ -431,11 +510,11 @@ const char WebPage[] = \
 "    font-size:.72rem; text-transform:uppercase; letter-spacing:.1em;\n" \
 "    color:var(--muted); margin:0 0 12px; font-weight:600;\n" \
 "  }\n" \
-"  input[type=text]{\n" \
+"  input[type=text],input[type=number]{\n" \
 "    width:100%; padding:11px 13px; border-radius:9px; border:1px solid var(--border);\n" \
 "    background:var(--inset); color:var(--text); font-size:1rem; font-family:var(--font-body);\n" \
 "  }\n" \
-"  input[type=text]:focus{outline:2px solid var(--accent); outline-offset:1px; border-color:transparent;}\n" \
+"  input[type=text]:focus,input[type=number]:focus{outline:2px solid var(--accent); outline-offset:1px; border-color:transparent;}\n" \
 "  .preview{\n" \
 "    margin-top:10px; padding:12px 14px; border-radius:9px; background:var(--inset);\n" \
 "    border:1px solid var(--border); font-family:'Courier New',monospace; font-size:1.05rem;\n" \
@@ -526,6 +605,14 @@ const char WebPage[] = \
 "\n" \
 "  <div class=\"panel active\" id=\"panelSettings\">\n" \
 "    <div class=\"card\">\n" \
+"      <h2>Mode</h2>\n" \
+"      <div class=\"modes\">\n" \
+"        <label><input type=\"radio\" name=\"appmode\" value=\"0\" checked onchange=\"onAppModeChange()\"><span>Message</span></label>\n" \
+"        <label><input type=\"radio\" name=\"appmode\" value=\"1\" onchange=\"onAppModeChange()\"><span>Clock</span></label>\n" \
+"      </div>\n" \
+"    </div>\n" \
+"\n" \
+"    <div class=\"card\" id=\"msgCard\">\n" \
 "      <h2>Message</h2>\n" \
 "      <form id=\"txt_form\" onsubmit=\"return false;\">\n" \
 "        <input type=\"text\" id=\"Message\" maxlength=\"255\" placeholder=\"Type your message...\">\n" \
@@ -545,6 +632,9 @@ const char WebPage[] = \
 "        <button type=\"button\" onclick=\"InsertIcon('[rain]')\">&#127783;</button>\n" \
 "        <button type=\"button\" onclick=\"InsertIcon('[pin]')\">&#128205;</button>\n" \
 "        <button type=\"button\" onclick=\"InsertIcon('[plus]')\">&#10133;</button>\n" \
+"        <button type=\"button\" onclick=\"InsertIcon('[warn]')\">&#9888;</button>\n" \
+"        <button type=\"button\" onclick=\"InsertIcon('[bolt]')\">&#9889;</button>\n" \
+"        <button type=\"button\" onclick=\"InsertIcon('[fire]')\">&#128293;</button>\n" \
 "        <button type=\"button\" onclick=\"InsertIcon('[up]')\">&uarr;</button>\n" \
 "        <button type=\"button\" onclick=\"InsertIcon('[down]')\">&darr;</button>\n" \
 "        <button type=\"button\" onclick=\"InsertIcon('[left]')\">&larr;</button>\n" \
@@ -554,7 +644,7 @@ const char WebPage[] = \
 "\n" \
 "    <div class=\"card\">\n" \
 "      <h2>Display</h2>\n" \
-"      <div class=\"row\">\n" \
+"      <div class=\"row\" id=\"spdRow\">\n" \
 "        <label>Speed</label>\n" \
 "        <input type=\"range\" id=\"spd\" min=\"20\" max=\"250\" value=\"75\" oninput=\"onSpdInput()\">\n" \
 "        <span class=\"val\" id=\"spdVal\">75</span>\n" \
@@ -564,9 +654,22 @@ const char WebPage[] = \
 "        <input type=\"range\" id=\"brt\" min=\"0\" max=\"15\" value=\"8\" oninput=\"onBrtInput()\">\n" \
 "        <span class=\"val\" id=\"brtVal\">8</span>\n" \
 "      </div>\n" \
-"      <div class=\"modes\">\n" \
+"      <div class=\"row\" id=\"tzRow\" style=\"display:none;\">\n" \
+"        <label>Timezone (UTC)</label>\n" \
+"        <input type=\"number\" id=\"tz\" min=\"-12\" max=\"14\" step=\"0.5\" value=\"-3\" onchange=\"SendText()\">\n" \
+"      </div>\n" \
+"      <div class=\"row\" id=\"dateRow\" style=\"display:none;\">\n" \
+"        <label style=\"flex:1 1 auto;\">Show date</label>\n" \
+"        <input type=\"checkbox\" id=\"dateOn\" checked onchange=\"onDateToggle()\" style=\"width:20px; height:20px; flex:0 0 auto;\">\n" \
+"      </div>\n" \
+"      <div class=\"row\" id=\"dateIvRow\" style=\"display:none;\">\n" \
+"        <label>Date every (s)</label>\n" \
+"        <input type=\"number\" id=\"dateIv\" min=\"5\" max=\"3600\" step=\"5\" value=\"30\" onchange=\"SendText()\">\n" \
+"      </div>\n" \
+"      <div class=\"modes\" id=\"msgModes\">\n" \
 "        <label><input type=\"radio\" name=\"msgmode\" value=\"0\" checked onchange=\"SendText()\"><span>Scroll</span></label>\n" \
 "        <label><input type=\"radio\" name=\"msgmode\" value=\"1\" onchange=\"SendText()\"><span>Blink</span></label>\n" \
+"        <label><input type=\"radio\" name=\"msgmode\" value=\"2\" onchange=\"SendText()\"><span>Blink+Scroll</span></label>\n" \
 "      </div>\n" \
 "    </div>\n" \
 "\n" \
@@ -600,7 +703,7 @@ const char WebPage[] = \
 "    <div class=\"card\">\n" \
 "      <h2>REST API</h2>\n" \
 "      <p class=\"hint\">Set the display message remotely (Home Assistant, Node-RED, curl, etc) with:</p>\n" \
-"      <div class=\"preview\" id=\"apiExample\" style=\"word-break:break-all; font-size:.85rem;\">GET /api/message?msg=Hello</div>\n" \
+"      <div class=\"preview\" id=\"apiExample\" style=\"word-break:break-all; font-size:.85rem;\">GET /api/display?msg=Hello</div>\n" \
 "      <div class=\"row\" style=\"margin-top:14px;\">\n" \
 "        <label style=\"flex:1 1 auto;\">Require API key</label>\n" \
 "        <input type=\"checkbox\" id=\"apiAuthToggle\" onchange=\"onApiAuthToggle()\" style=\"width:20px; height:20px; flex:0 0 auto;\">\n" \
@@ -622,6 +725,7 @@ const char WebPage[] = \
 "  \"[star]\":\"\\u2b50\", \"[music]\":\"\\u266a\", \"[bell]\":\"\\u{1F514}\", \"[clock]\":\"\\u{1F550}\",\n" \
 "  \"[ok]\":\"\\u2713\", \"[x]\":\"\\u2717\", \"[sun]\":\"\\u2600\", \"[rain]\":\"\\u{1F327}\",\n" \
 "  \"[pin]\":\"\\u{1F4CD}\", \"[plus]\":\"\\u2795\",\n" \
+"  \"[warn]\":\"\\u26a0\", \"[bolt]\":\"\\u26a1\", \"[fire]\":\"\\u{1F525}\",\n" \
 "  \"[up]\":\"\\u2191\", \"[down]\":\"\\u2193\", \"[left]\":\"\\u2190\", \"[right]\":\"\\u2192\"\n" \
 "};\n" \
 "\n" \
@@ -653,6 +757,33 @@ const char WebPage[] = \
 "  return \"0\";\n" \
 "}\n" \
 "\n" \
+"function currentAppMode(){\n" \
+"  var r = document.getElementsByName(\"appmode\");\n" \
+"  for (var i=0;i<r.length;i++) if (r[i].checked) return r[i].value;\n" \
+"  return \"0\";\n" \
+"}\n" \
+"\n" \
+"function updateModeUI(){\n" \
+"  var clock = currentAppMode() === \"1\";\n" \
+"  var dateOn = document.getElementById(\"dateOn\").checked;\n" \
+"  document.getElementById(\"msgCard\").style.display = clock ? \"none\" : \"block\";\n" \
+"  document.getElementById(\"spdRow\").style.display = clock ? \"none\" : \"flex\";\n" \
+"  document.getElementById(\"msgModes\").style.display = clock ? \"none\" : \"flex\";\n" \
+"  document.getElementById(\"tzRow\").style.display = clock ? \"flex\" : \"none\";\n" \
+"  document.getElementById(\"dateRow\").style.display = clock ? \"flex\" : \"none\";\n" \
+"  document.getElementById(\"dateIvRow\").style.display = (clock && dateOn) ? \"flex\" : \"none\";\n" \
+"}\n" \
+"\n" \
+"function onAppModeChange(){\n" \
+"  updateModeUI();\n" \
+"  SendText();\n" \
+"}\n" \
+"\n" \
+"function onDateToggle(){\n" \
+"  updateModeUI();\n" \
+"  SendText();\n" \
+"}\n" \
+"\n" \
 "function showStatus(msg, isError){\n" \
 "  var s = document.getElementById(\"status\");\n" \
 "  s.textContent = msg;\n" \
@@ -666,10 +797,16 @@ const char WebPage[] = \
 "  var spd = document.getElementById(\"spd\").value;\n" \
 "  var brt = document.getElementById(\"brt\").value;\n" \
 "  var mode = currentMsgMode();\n" \
+"  var tzMin = Math.round((parseFloat(document.getElementById(\"tz\").value) || 0) * 60);\n" \
+"  var dateIv = parseInt(document.getElementById(\"dateIv\").value, 10) || 30;\n" \
 "  var qs = \"&MSG=\" + encodeURIComponent(msg) +\n" \
 "           \"/&SPD=\" + spd +\n" \
 "           \"/&BRT=\" + brt +\n" \
 "           \"/&MODE=\" + mode +\n" \
+"           \"/&DMODE=\" + currentAppMode() +\n" \
+"           \"/&TZ=\" + tzMin +\n" \
+"           \"/&DATEON=\" + (document.getElementById(\"dateOn\").checked ? \"1\" : \"0\") +\n" \
+"           \"/&DATEIV=\" + dateIv +\n" \
 "           \"/&nocache=\" + Math.random();\n" \
 "\n" \
 "  var request = new XMLHttpRequest();\n" \
@@ -729,7 +866,7 @@ const char WebPage[] = \
 "  document.getElementById(\"apiKeyField\").style.display = enabled ? \"block\" : \"none\";\n" \
 "  document.getElementById(\"apiKeyValue\").value = key || \"\";\n" \
 "  document.getElementById(\"apiExample\").textContent =\n" \
-"    \"GET /api/message?msg=Hello\" + (enabled ? \"  (header X-API-Key required)\" : \"\");\n" \
+"    \"GET /api/display?msg=Hello\" + (enabled ? \"  (header X-API-Key required)\" : \"\");\n" \
 "}\n" \
 "\n" \
 "function loadApiSettings(next){\n" \
@@ -812,9 +949,10 @@ const char WebPage[] = \
 "  var request = new XMLHttpRequest();\n" \
 "  request.open(\"GET\", \"/&SETTINGS=1/&nocache=\" + Math.random(), true);\n" \
 "  request.onload = function(){\n" \
-"    // scrollDelay, brightness, displayMode, last message\n" \
+"    // scrollDelay, brightness, displayMode, appMode, tzOffsetMin,\n" \
+"    // dateEnabled, dateEveryS, last message\n" \
 "    var parts = request.responseText.split(\",\");\n" \
-"    if (parts.length < 3) return;\n" \
+"    if (parts.length < 7) return;\n" \
 "    var displayMode = parts[2];\n" \
 "\n" \
 "    document.getElementById(\"spd\").value = parts[0];\n" \
@@ -825,10 +963,17 @@ const char WebPage[] = \
 "    var msgModeInput = document.querySelector(\"input[name=msgmode][value='\" + displayMode + \"']\");\n" \
 "    if (msgModeInput) msgModeInput.checked = true;\n" \
 "\n" \
+"    var appModeInput = document.querySelector(\"input[name=appmode][value='\" + parts[3] + \"']\");\n" \
+"    if (appModeInput) appModeInput.checked = true;\n" \
+"    document.getElementById(\"tz\").value = parseInt(parts[4], 10) / 60;\n" \
+"    document.getElementById(\"dateOn\").checked = parts[5] === \"1\";\n" \
+"    document.getElementById(\"dateIv\").value = parseInt(parts[6], 10) || 30;\n" \
+"    updateModeUI();\n" \
+"\n" \
 "    // Prefill the message box with the last message sent (the message\n" \
-"    // may contain commas, so rejoin everything after the 3rd field),\n" \
+"    // may contain commas, so rejoin everything after the 7th field),\n" \
 "    // unless the user already started typing.\n" \
-"    var lastMsg = parts.slice(3).join(\",\");\n" \
+"    var lastMsg = parts.slice(7).join(\",\");\n" \
 "    var msgEl = document.getElementById(\"Message\");\n" \
 "    if (lastMsg && !msgEl.value){ msgEl.value = lastMsg; updatePreview(); }\n" \
 "    if (next) next();\n" \
@@ -1023,6 +1168,8 @@ void handleWiFi(void)
   static bool wantsSettings = false;
   static bool wantsApiMessage = false;
   static bool apiMessageOk = false;
+  static bool apiSettingsChanged = false;
+  static uint16_t apiAlertSecs = 0;   // >0 while handling an ?alert= request
   static bool apiAuthFailed = false;
   static bool wantsApiSettings = false;
 
@@ -1098,7 +1245,7 @@ void handleWiFi(void)
       char szParam[8];
       bool settingsChanged = false;
 
-      wantsApiMessage = (strncmp(szBuf, "GET /api/message", 16) == 0);
+      wantsApiMessage = (strncmp(szBuf, "GET /api/display", 16) == 0);
       wantsNetInfo = false;
       wantsSettings = false;
       wantsApiSettings = false;
@@ -1131,6 +1278,29 @@ void handleWiFi(void)
           newMessageAvailable = true;
         }
 
+        // Temporary alert: ?msg=...&alert=<seconds> shows the message for
+        // that long, then loop() restores the state snapshotted here -
+        // before spd/brt/mode below can touch it. A second alert while one
+        // is active keeps the original snapshot and just resets the timer;
+        // a plain message cancels any pending revert.
+        apiAlertSecs = 0;
+        if (apiMessageOk && getQueryParam(szBuf, "alert", szParam, sizeof(szParam)))
+        {
+          apiAlertSecs = (uint16_t)constrain(atoi(szParam), 1, 3600);
+          if (!alertActive)
+          {
+            alertPrevAppMode = appMode;
+            alertPrevDisplayMode = displayMode;
+            alertPrevScrollDelay = scrollDelay;
+            alertPrevBrightness = brightness;
+            strcpy(alertPrevMessage, curMessage);
+            alertActive = true;
+          }
+          alertRevertTime = millis() + (uint32_t)apiAlertSecs * 1000;
+        }
+        else if (apiMessageOk)
+          alertActive = false;
+
         if (getQueryParam(szBuf, "spd", szParam, sizeof(szParam)))
         {
           uint8_t v = (uint8_t)constrain(atoi(szParam), MIN_SCROLL_DELAY, MAX_SCROLL_DELAY);
@@ -1143,18 +1313,59 @@ void handleWiFi(void)
         }
         if (getQueryParam(szBuf, "mode", szParam, sizeof(szParam)))
         {
-          uint8_t v = (uint8_t)constrain(atoi(szParam), 0, 1);
+          uint8_t v = (uint8_t)constrain(atoi(szParam), 0, 2);
           if (v != displayMode)
           {
             displayMode = v;
             mx.control(MD_MAX72XX::SHUTDOWN, MD_MAX72XX::OFF);
             resetScrollSource();
             if (displayMode == 0) newMessageAvailable = true;
-            else showStatic();
+            else if (displayMode == 1) showStatic();
+            else resetBlinkScroll();
             settingsChanged = true;
           }
         }
-        if (settingsChanged) saveSettings();
+        if (getQueryParam(szBuf, "tz", szParam, sizeof(szParam)))
+        {
+          int16_t v = (int16_t)constrain(atoi(szParam), MIN_TZ_OFFSET_MIN, MAX_TZ_OFFSET_MIN);
+          if (v != tzOffsetMin)
+          {
+            tzOffsetMin = v;
+            if (!apMode) applyTimeConfig();
+            settingsChanged = true;
+          }
+        }
+        if (getQueryParam(szBuf, "date", szParam, sizeof(szParam)))
+        {
+          bool v = (szParam[0] == '1');
+          if (v != dateEnabled) { dateEnabled = v; settingsChanged = true; }
+        }
+        if (getQueryParam(szBuf, "dateint", szParam, sizeof(szParam)))
+        {
+          uint16_t v = (uint16_t)constrain(atoi(szParam), MIN_DATE_EVERY_S, MAX_DATE_EVERY_S);
+          if (v != dateEveryS) { dateEveryS = v; settingsChanged = true; }
+        }
+        // Top-level mode: ?display=clock|message. Sending a message
+        // without an explicit display= also switches back to message
+        // mode, so a plain ?msg=... always ends up visible.
+        {
+          uint8_t v = appMode;
+          if (getQueryParam(szBuf, "display", szParam, sizeof(szParam)))
+          {
+            v = (strcmp(szParam, "clock") == 0) ? APP_MODE_CLOCK : APP_MODE_MESSAGE;
+            if (apiAlertSecs == 0) alertActive = false;  // explicit mode change wins over a pending revert
+          }
+          else if (apiMessageOk)
+            v = APP_MODE_MESSAGE;
+          if (v != appMode)
+          {
+            setAppMode(v);
+            settingsChanged = true;
+          }
+        }
+        // Alert state is temporary by definition - don't persist it
+        if (settingsChanged && (apiAlertSecs == 0)) saveSettings();
+        apiSettingsChanged = settingsChanged;
 
         state = S_RESPONSE;
         break;
@@ -1163,7 +1374,10 @@ void handleWiFi(void)
       // Extract the message text, if there is one
       newMessageAvailable = getParam(szBuf, "MSG", newMessage, MESG_SIZE);
       if (newMessageAvailable)
+      {
         expandIcons(newMessage);
+        alertActive = false;  // explicit user message cancels a pending alert revert
+      }
       PRINT("\nNew Msg: ", newMessage);
 
       // Optional scroll speed, brightness and display mode
@@ -1179,7 +1393,7 @@ void handleWiFi(void)
       }
       if (getParam(szBuf, "MODE", szParam, sizeof(szParam)))
       {
-        uint8_t v = (uint8_t)constrain(atoi(szParam), 0, 1);
+        uint8_t v = (uint8_t)constrain(atoi(szParam), 0, 2);
         if (v != displayMode)
         {
           displayMode = v;
@@ -1190,9 +1404,40 @@ void handleWiFi(void)
             // start scroll mode from the last user message
             newMessageAvailable = true;
           }
-          else showStatic();  // redraw immediately in static mode
+          else if (displayMode == 1) showStatic();  // redraw immediately in static mode
+          else resetBlinkScroll();                  // blinkScroll() redraws on the next loop()
           settingsChanged = true;
         }
+      }
+      if (getParam(szBuf, "DMODE", szParam, sizeof(szParam)))
+      {
+        uint8_t v = (uint8_t)constrain(atoi(szParam), APP_MODE_MESSAGE, APP_MODE_CLOCK);
+        alertActive = false;  // explicit mode choice from the UI wins over a pending revert
+        if (v != appMode)
+        {
+          setAppMode(v);
+          settingsChanged = true;
+        }
+      }
+      if (getParam(szBuf, "TZ", szParam, sizeof(szParam)))
+      {
+        int16_t v = (int16_t)constrain(atoi(szParam), MIN_TZ_OFFSET_MIN, MAX_TZ_OFFSET_MIN);
+        if (v != tzOffsetMin)
+        {
+          tzOffsetMin = v;
+          if (!apMode) applyTimeConfig();
+          settingsChanged = true;
+        }
+      }
+      if (getParam(szBuf, "DATEON", szParam, sizeof(szParam)))
+      {
+        bool v = (szParam[0] == '1');
+        if (v != dateEnabled) { dateEnabled = v; settingsChanged = true; }
+      }
+      if (getParam(szBuf, "DATEIV", szParam, sizeof(szParam)))
+      {
+        uint16_t v = (uint16_t)constrain(atoi(szParam), MIN_DATE_EVERY_S, MAX_DATE_EVERY_S);
+        if (v != dateEveryS) { dateEveryS = v; settingsChanged = true; }
       }
       if (settingsChanged) saveSettings();
 
@@ -1237,20 +1482,29 @@ void handleWiFi(void)
     }
     else if (wantsApiMessage)
     {
-      char szJson[MESG_SIZE * 2 + 32];
+      char szJson[MESG_SIZE * 4 + 32];
       if (apiMessageOk)
       {
-        // Escape '"' and '\' so the message can't break out of the JSON string
-        char szEsc[MESG_SIZE * 2];
+        // Icon control bytes are not valid inside a JSON string, so echo
+        // the message with them collapsed back to their [tag] form, then
+        // escape '"' and '\' so the text can't break out of the string
+        char szTags[MESG_SIZE * 2];
+        char szEsc[MESG_SIZE * 4];
+        collapseIcons(newMessage, szTags, sizeof(szTags));
         char *pOut = szEsc;
-        for (char *pIn = newMessage; *pIn != '\0'; pIn++)
+        for (char *pIn = szTags; *pIn != '\0'; pIn++)
         {
           if ((*pIn == '"') || (*pIn == '\\')) *pOut++ = '\\';
           *pOut++ = *pIn;
         }
         *pOut = '\0';
-        sprintf(szJson, "{\"ok\":true,\"msg\":\"%s\"}", szEsc);
+        if (apiAlertSecs > 0)
+          sprintf(szJson, "{\"ok\":true,\"msg\":\"%s\",\"alert\":%u}", szEsc, apiAlertSecs);
+        else
+          sprintf(szJson, "{\"ok\":true,\"msg\":\"%s\"}", szEsc);
       }
+      else if (apiSettingsChanged)
+        sprintf(szJson, "{\"ok\":true}");
       else
         sprintf(szJson, "{\"ok\":false,\"error\":\"missing msg parameter\"}");
       sendResponseHeader(client, strlen(szJson), false, "application/json");
@@ -1266,15 +1520,17 @@ void handleWiFi(void)
     }
     else if (wantsSettings)
     {
-      // scrollDelay, brightness, displayMode, last saved message (icon
-      // control bytes collapsed back to [tag] form so it can be edited).
-      // The message goes last because it may itself contain commas - the
-      // UI rejoins everything after the third field.
-      char szSettings[MESG_SIZE * 7 + 16]; // worst case: every byte is a 7-char [tag]
+      // scrollDelay, brightness, displayMode, appMode, tzOffsetMin,
+      // dateEnabled, dateEveryS, last saved message (icon control bytes
+      // collapsed back to [tag] form so it can be edited). The message
+      // goes last because it may itself contain commas - the UI rejoins
+      // everything after the seventh field.
+      char szSettings[MESG_SIZE * 7 + 48]; // worst case: every byte is a 7-char [tag]
       char szLast[MESG_SIZE];
 
       if (!loadLastMessage(szLast, sizeof(szLast))) szLast[0] = '\0';
-      sprintf(szSettings, "%d,%d,%d,", scrollDelay, brightness, displayMode);
+      sprintf(szSettings, "%d,%d,%d,%d,%d,%d,%d,", scrollDelay, brightness, displayMode, appMode, tzOffsetMin,
+              dateEnabled ? 1 : 0, dateEveryS);
       collapseIcons(szLast, szSettings + strlen(szSettings), sizeof(szSettings) - strlen(szSettings));
       sendResponseHeader(client, strlen(szSettings), false);
       client.print(szSettings);
@@ -1306,8 +1562,9 @@ void handleWiFi(void)
     client.flush();
     client.stop();
     // Persist the new message after replying, so the flash write doesn't
-    // delay the HTTP response the browser is waiting on.
-    if (newMessageAvailable) saveLastMessage(newMessage);
+    // delay the HTTP response the browser is waiting on. Alert messages
+    // are temporary and must not clobber the saved one.
+    if (newMessageAvailable && !alertActive) saveLastMessage(newMessage);
     state = S_IDLE;
     break;
 
@@ -1331,12 +1588,35 @@ void scrollDataSink(uint8_t dev, MD_MAX72XX::transformType_t t, uint8_t col)
 enum scrollState_t { S_IDLE, S_NEXT_CHAR, S_SHOW_CHAR, S_SHOW_SPACE };
 scrollState_t scrollSourceState = S_IDLE;
 bool scrollSourceResetPending = false;
+char *scrollResumePos = NULL;  // where S_IDLE starts feeding (NULL = start of curMessage)
+bool scrollHoldAtEnd = false;  // one-shot pass: feed blanks after the message ends instead of wrapping
 
 void resetScrollSource(void)
 // Force scrollDataSource() to restart from the beginning of curMessage
 // on its next call, discarding whatever it was in the middle of.
 {
   scrollSourceResetPending = true;
+  scrollResumePos = NULL;
+  scrollHoldAtEnd = false;
+}
+
+void resetScrollSourceAt(char *pos)
+// One-shot scroll pass starting mid-message: scrollDataSource() feeds
+// columns from pos onward and holds blank after the end instead of
+// wrapping back to the start of the message.
+{
+  scrollSourceResetPending = true;
+  scrollResumePos = pos;
+  scrollHoldAtEnd = true;
+}
+
+bool blinkScrollResetPending = false;
+
+void resetBlinkScroll(void)
+// Force blinkScroll() to re-measure curMessage and restart from the
+// blink phase on its next call (its state persists across mode changes).
+{
+  blinkScrollResetPending = true;
 }
 
 uint8_t scrollDataSource(uint8_t dev, MD_MAX72XX::transformType_t t)
@@ -1365,6 +1645,13 @@ uint8_t scrollDataSource(uint8_t dev, MD_MAX72XX::transformType_t t)
       strcpy(curMessage, newMessage); // copy it in
       newMessageAvailable = false;
     }
+    if (scrollResumePos != NULL)
+    {
+      p = scrollResumePos;  // one-shot pass resuming mid-message
+      scrollResumePos = NULL;
+    }
+    else if (scrollHoldAtEnd)
+      break;  // one-shot pass done: keep feeding blank columns
     scrollSourceState = S_NEXT_CHAR;
     break;
 
@@ -1415,15 +1702,42 @@ uint8_t scrollDataSource(uint8_t dev, MD_MAX72XX::transformType_t t)
   return(colData);
 }
 
-void showStatic(void)
-// Render curMessage statically (no scroll), left-aligned, truncated to
-// what fits on the display. Columns are filled from the rightmost
-// device backwards, matching how the hardware chain is wired (the
-// same orientation the scrolling mode ends up on screen).
+uint16_t measureStaticText(const char *szMesg)
+// Width in columns of a message as renderStaticText() draws it: glyph
+// widths plus one spacing column between glyphs (none after the last)
+{
+  uint16_t w = 0;
+  uint8_t cBuf[8];
+
+  for (const char *p = szMesg; *p != '\0'; p++)
+  {
+    const icon_t *icon = findIconByCode(*p);
+    w += ((icon != NULL) ? icon->width : mx.getChar(*p, sizeof(cBuf), cBuf)) + 1;
+  }
+  return (w > 0) ? w - 1 : 0;
+}
+
+void renderStaticText(const char *szMesg, bool center = false, const char **rest = NULL)
+// Render a message statically (no scroll), left-aligned by default or
+// horizontally centered, truncated to what fits on the display. The
+// highest column index is the left edge of the display (TSL shifts
+// toward higher columns), so the cursor starts high and walks down
+// while each glyph's font data is written forward - the same
+// orientation setChar() and the scroll mode produce.
+// When rest is given, glyphs are never cut in half: rendering stops
+// before the first glyph that doesn't fully fit and *rest points at it
+// (or at the terminator when the whole message fit), so a scroll pass
+// can resume exactly where the static view left off.
 {
   const uint16_t totalCols = MAX_DEVICES * COL_SIZE;
   int16_t col = totalCols - 1;
-  char *p = curMessage;
+
+  if (center)
+  {
+    uint16_t w = measureStaticText(szMesg);
+    if (w < totalCols) col -= (totalCols - w) / 2;
+  }
+  const char *p = szMesg;
   uint8_t cBuf[8];
 
   mx.clear();
@@ -1440,12 +1754,24 @@ void showStatic(void)
     else
       len = mx.getChar(*p, sizeof(cBuf) / sizeof(cBuf[0]), cBuf);
 
-    for (int8_t i = len - 1; (i >= 0) && (col >= 0); i--, col--)
+    if ((rest != NULL) && (col < (int16_t)len - 1))
+      break;  // glyph would be cut: stop here so the caller can resume from it
+
+    // cBuf[0] is the glyph's leftmost column and higher display columns
+    // are further left, so walk the font data forward while the column
+    // cursor moves right (same orientation setChar()/scroll mode use).
+    for (uint8_t i = 0; (i < len) && (col >= 0); i++, col--)
       mx.setColumn(col, cBuf[i]);
     if (col >= 0) { mx.setColumn(col, 0); col--; } // spacing
 
     p++;
   }
+  if (rest != NULL) *rest = p;
+}
+
+void showStatic(void)
+{
+  renderStaticText(curMessage);
 }
 
 void staticBlink(void)
@@ -1469,6 +1795,199 @@ void staticBlink(void)
   }
 }
 
+void blinkScroll(void)
+// Blink+Scroll mode: blink the part of the message that fits the
+// display for BLINK_PHASE_MS, then scroll once through the part that
+// was not visible, repeating. Messages that fit entirely just blink.
+{
+  static uint32_t prevTime = 0, phaseStart = 0;
+  static bool lit = true;
+  static bool scrolling = false;
+  static int16_t colsLeft = 0;
+  static const char *restPos = "";
+  static uint16_t restWidth = 0;
+  static bool measured = false;
+  const uint16_t totalCols = MAX_DEVICES * COL_SIZE;
+
+  if (newMessageAvailable)
+  {
+    strcpy(curMessage, newMessage);
+    newMessageAvailable = false;
+    measured = false;
+  }
+  if (!measured || blinkScrollResetPending)
+  {
+    measured = true;
+    blinkScrollResetPending = false;
+    scrolling = false;
+    lit = true;
+    phaseStart = millis();
+    mx.control(MD_MAX72XX::SHUTDOWN, MD_MAX72XX::OFF);
+    renderStaticText(curMessage, false, &restPos);
+    restWidth = measureStaticText(restPos);
+  }
+
+  if (scrolling)
+  {
+    if (millis() - prevTime >= scrollDelay)
+    {
+      mx.transform(MD_MAX72XX::TSL);
+      prevTime = millis();
+      if (--colsLeft <= 0)
+      {
+        scrolling = false;
+        lit = true;
+        phaseStart = millis();
+        renderStaticText(curMessage, false, &restPos);
+      }
+    }
+    return;
+  }
+
+  if (millis() - prevTime >= BLINK_INTERVAL)
+  {
+    lit = !lit;
+    mx.control(MD_MAX72XX::SHUTDOWN, lit ? MD_MAX72XX::OFF : MD_MAX72XX::ON);
+    prevTime = millis();
+  }
+  if ((*restPos != '\0') && (millis() - phaseStart >= BLINK_PHASE_MS))
+  {
+    scrolling = true;
+    mx.control(MD_MAX72XX::SHUTDOWN, MD_MAX72XX::OFF); // blink may have left the panel off
+    resetScrollSourceAt((char *)restPos);
+    colsLeft = restWidth + totalCols; // hidden part enters, then the display drains
+    prevTime = millis();
+  }
+}
+
+// Clock mode ---------------------------------------------------------
+// Renders "HH MM ss" across the 32 columns: hours and minutes in a
+// 4x7 digit font with a blinking colon between them, seconds in a
+// smaller 3x5 font bottom-aligned at the right. When dateEnabled, every
+// dateEveryS seconds the date (DD/MM) takes over the display for
+// CLOCK_DATE_SHOW_S seconds, using the regular text font.
+
+// 4 columns per digit, LSB = top row, rows 0..6 used
+const uint8_t clockDigitBig[10][4] =
+{
+  { 0x3e, 0x41, 0x41, 0x3e },  // 0
+  { 0x00, 0x42, 0x7f, 0x40 },  // 1
+  { 0x62, 0x51, 0x49, 0x46 },  // 2
+  { 0x22, 0x41, 0x49, 0x36 },  // 3
+  { 0x18, 0x14, 0x12, 0x7f },  // 4
+  { 0x27, 0x45, 0x45, 0x39 },  // 5
+  { 0x3e, 0x49, 0x49, 0x30 },  // 6
+  { 0x01, 0x61, 0x19, 0x07 },  // 7
+  { 0x36, 0x49, 0x49, 0x36 },  // 8
+  { 0x06, 0x49, 0x49, 0x3e },  // 9
+};
+
+// 3 columns per digit, LSB = top row, rows 0..4 used (shifted down at
+// render time so they sit bottom-aligned with the big digits)
+const uint8_t clockDigitSmall[10][3] =
+{
+  { 0x1f, 0x11, 0x1f },  // 0
+  { 0x12, 0x1f, 0x10 },  // 1
+  { 0x1d, 0x15, 0x17 },  // 2
+  { 0x15, 0x15, 0x1f },  // 3
+  { 0x07, 0x04, 0x1f },  // 4
+  { 0x17, 0x15, 0x1d },  // 5
+  { 0x1f, 0x15, 0x1d },  // 6
+  { 0x01, 0x19, 0x07 },  // 7
+  { 0x1f, 0x15, 0x1f },  // 8
+  { 0x17, 0x15, 0x1f },  // 9
+};
+
+bool clockRedrawPending = false;
+
+void clockForceRedraw(void)
+// Called when the device switches into clock mode so the next
+// clockTick() repaints immediately instead of waiting for the next
+// second/colon change.
+{
+  clockRedrawPending = true;
+}
+
+void drawClockGlyph(int16_t &col, const uint8_t *cols, uint8_t width, uint8_t shift)
+// Draw one glyph at the cursor and advance it (same column order
+// renderStaticText() uses: font data forward, cursor moving right),
+// followed by a blank spacing column.
+{
+  for (uint8_t i = 0; (i < width) && (col >= 0); i++, col--)
+    mx.setColumn(col, (uint8_t)(cols[i] << shift));
+  if (col >= 0) col--;  // spacing column (display was cleared, already blank)
+}
+
+void drawClockFace(const struct tm *t, bool colonOn)
+{
+  const uint8_t colon = 0x24;  // two 1-pixel dots, rows 2 and 5
+  int16_t col = MAX_DEVICES * COL_SIZE - 1;
+
+  mx.clear();
+  drawClockGlyph(col, clockDigitBig[t->tm_hour / 10], 4, 0);
+  drawClockGlyph(col, clockDigitBig[t->tm_hour % 10], 4, 0);
+  if (colonOn) mx.setColumn(col, colon);
+  col -= 2;  // colon column + spacing
+  drawClockGlyph(col, clockDigitBig[t->tm_min / 10], 4, 0);
+  drawClockGlyph(col, clockDigitBig[t->tm_min % 10], 4, 0);
+  col--;  // extra gap before the small seconds
+  drawClockGlyph(col, clockDigitSmall[t->tm_sec / 10], 3, 2);
+  drawClockGlyph(col, clockDigitSmall[t->tm_sec % 10], 3, 2);
+}
+
+void clockTick(void)
+// Non-blocking clock renderer, called from loop() while in clock mode.
+// Repaints only when something visible changed (second rollover, colon
+// blink, sync state), checking at most every 100 ms.
+{
+  static uint32_t prevCheck = 0;
+  static int8_t lastSec = -1;
+  static bool lastColon = false;
+  static bool wasSynced = true;
+
+  if (!clockRedrawPending && (millis() - prevCheck < 100)) return;
+  prevCheck = millis();
+
+  struct tm tmNow;
+  bool synced = !apMode && getLocalTime(&tmNow, 0);
+
+  if (!synced)
+  {
+    if (wasSynced || clockRedrawPending)
+      renderStaticText("--:--");
+    wasSynced = false;
+    lastSec = -1;
+    clockRedrawPending = false;
+    return;
+  }
+  wasSynced = true;
+
+  // Periodically let the date take over the whole display (epoch-based
+  // so intervals longer than a minute work too)
+  time_t nowEpoch;
+  time(&nowEpoch);
+  if (dateEnabled && ((nowEpoch % dateEveryS) < CLOCK_DATE_SHOW_S))
+  {
+    if ((tmNow.tm_sec != lastSec) || clockRedrawPending)
+    {
+      char szDate[12];
+      sprintf(szDate, "%02d/%02d", tmNow.tm_mday, tmNow.tm_mon + 1);
+      renderStaticText(szDate, true);  // centered, it doesn't fill the display
+      lastSec = tmNow.tm_sec;
+    }
+    clockRedrawPending = false;
+    return;
+  }
+
+  bool colonOn = ((millis() / 500) & 1) == 0;  // blink twice per second
+  if ((tmNow.tm_sec != lastSec) || (colonOn != lastColon) || clockRedrawPending)
+  {
+    drawClockFace(&tmNow, colonOn);
+    lastSec = tmNow.tm_sec;
+    lastColon = colonOn;
+    clockRedrawPending = false;
+  }
+}
 
 void scrollText(void)
 {
@@ -1522,6 +2041,10 @@ void setup(void)
   // emergency setup Access Point if that fails
   connectWiFi();
 
+  // Start background NTP sync for the clock mode (station mode only -
+  // there is no internet to reach from the setup AP)
+  if (!apMode) applyTimeConfig();
+
   // Start the server
   PRINTS("\nStarting Server");
   server.begin();
@@ -1535,7 +2058,9 @@ void setup(void)
   }
   PRINT("\nStartup message ", curMessage);
 
-  if (displayMode == 1) showStatic();  // static mode: render immediately
+  if (appMode == APP_MODE_CLOCK) clockForceRedraw();  // paint the clock right away
+  else if (displayMode == 1) showStatic();            // static mode: render immediately
+  else if (displayMode == 2) resetBlinkScroll();      // blink+scroll renders on the first loop()
 }
 
 void loop(void)
@@ -1556,9 +2081,27 @@ void loop(void)
     return;
   }
 
+  // Alert expired: restore the display state snapshotted when it was
+  // accepted (mode, message, brightness, speed, sub-mode)
+  if (alertActive && ((int32_t)(millis() - alertRevertTime) >= 0))
+  {
+    alertActive = false;
+    scrollDelay = alertPrevScrollDelay;
+    brightness = alertPrevBrightness;
+    mx.control(MD_MAX72XX::INTENSITY, brightness);
+    displayMode = alertPrevDisplayMode;
+    strcpy(newMessage, alertPrevMessage);
+    newMessageAvailable = true;
+    setAppMode(alertPrevAppMode);  // handles the clock redraw / scroll reset
+  }
+
   handleWiFi();
-  if (displayMode == 0)
+  if (appMode == APP_MODE_CLOCK)
+    clockTick();
+  else if (displayMode == 0)
     scrollText();
+  else if (displayMode == 2)
+    blinkScroll();
   else
     staticBlink();
 }
