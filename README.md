@@ -1,5 +1,9 @@
 # ESP32 Matrix Display
 
+> **⚠️ Archived:** This repository is no longer maintained. Development
+> continues at
+> [ibm-bob-matrix-clock](https://github.com/jansouza/ibm-bob-matrix-clock).
+
 Firmware for ESP32 that controls an LED matrix (MAX7219/MAX72XX, via
 [MD_MAX72XX](https://github.com/MajicDesigns/MD_MAX72XX)) and turns it into a
 WiFi-connected scrolling display, controllable via a web interface and a simple
@@ -56,6 +60,8 @@ Pins can be adjusted at the top of the `.ino` file (`CLK_PIN`, `DATA_PIN`, `CS_P
 
 - [Arduino core for ESP32](https://github.com/espressif/arduino-esp32)
 - [MD_MAX72XX](https://github.com/MajicDesigns/MD_MAX72XX) (matrix control library)
+- [ESP Async WebServer](https://github.com/ESP32Async/ESPAsyncWebServer) (the actively maintained ESP32Async fork — pulls in its own `Async TCP` as a dependency; do not install the older `AsyncTCP`/`ESPAsyncTCP` libraries alongside it, they conflict on the `AsyncTCP.h` header)
+- [ArduinoJson](https://github.com/bblanchon/ArduinoJson) (v7.x, used for building JSON API responses)
 
 ## Getting Started
 
@@ -140,4 +146,4 @@ settings (WiFi, brightness, speed, API key) and return to factory defaults.
 
 ## License
 
-Define the project license here (e.g., MIT).
+MIT — see [LICENSE](LICENSE).
