@@ -45,8 +45,10 @@ rest_command:
       X-API-Key: !secret matrix_display_key
 
   matrix_clock:
+    # tz is now an IANA zone name (was a UTC-offset-in-minutes integer) -
+    # see docs/rest-api.md's "Breaking change" note.
     url: >-
-      http://192.168.1.50/api/display?display=clock&tz={{ tz | default(-180)
+      http://192.168.1.50/api/display?display=clock&tz={{ tz | default('America/Sao_Paulo')
       }}&date={{ date | default(1) }}&dateint={{ dateint | default(30) }}&brt={{ brightness | default(4) }}
     headers:
       X-API-Key: !secret matrix_display_key
@@ -60,7 +62,6 @@ rest_command:
     url: "http://192.168.1.50/api/display?brt={{ brightness }}"
     headers:
       X-API-Key: !secret matrix_display_key
-
 ```
 
 Usage:

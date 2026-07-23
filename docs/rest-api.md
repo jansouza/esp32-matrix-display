@@ -40,11 +40,21 @@ An unauthorized request returns HTTP 200 with:
 | `mode` | integer | `0` / `1` / `2` | Message sub-mode: `0` = scroll, `1` = static with blink, `2` = blink+scroll. Saved to NVS (unless sent with `alert`). |
 | `alert` | integer | 1 – 3600 | Show `msg` for N seconds, then automatically restore the previous state (mode, message, brightness, speed). Requires `msg`. Settings sent along with `alert` are also temporary. |
 | `display` | string | `clock` / `life` (or `gol`) / `message` | Switches the top-level display mode. `message` shows the current message; `clock` shows the NTP clock; `life`/`gol` shows an evolving Conway's Game of Life board. Saved to NVS. |
-| `tz` | integer | -720 – 840 | Timezone as a UTC offset in **minutes** (e.g. `-180` for UTC-3, `60` for UTC+1, `330` for UTC+5:30). Saved to NVS. |
-| `date` | integer | `0` / `1` | Clock mode only. `1` = periodically show the date (`DD/MM`) for a few seconds. Saved to NVS. |
+| `tz` | string | IANA zone name | **Breaking change**: `tz` used to be a UTC offset in minutes; it is now an IANA timezone name (e.g. `America/Chicago`, `Europe/Berlin`), validated against the device's built-in zone table. Unknown names are ignored. Automatically applies DST for zones that observe it. Saved to NVS. See `GET /api/timezones` for the full list of accepted names. |
+| `lang` | string | `en` / `pt` / `de` / `es` / `fr` / `it` | Clock mode only. Language for the weekday abbreviation on the periodic date screen. Saved to NVS. |
+| `date` | integer | `0` / `1` | Clock mode only. `1` = periodically show the date for a few seconds. Saved to NVS. |
 | `dateint` | integer | 5 – 3600 | Clock mode only. How often (in seconds) to show the date. Requires `date=1`. Saved to NVS. |
+| `dateus` | integer | `0` / `1` | Clock mode only. `0` = day/month order, `1` = month/day order. Saved to NVS. |
 
 All parameters are optional. A request with no parameters is valid (returns `{"ok":true}`) but changes nothing.
+
+### Supported timezones
+
+```
+GET /api/timezones
+```
+
+Returns a JSON array of every accepted IANA zone name for the `tz` parameter above, e.g. `["Africa/Cairo","Africa/Casablanca",...]`. This endpoint is not gated by `X-API-Key`.
 
 ### Message sub-modes (`mode`)
 
@@ -179,11 +189,11 @@ curl -H "X-API-Key: <key>" \
 
 ### Switch to clock mode with full configuration
 
-Timezone UTC-3, date shown every 60 seconds:
+Timezone São Paulo, date shown every 60 seconds:
 
 ```bash
 curl -H "X-API-Key: <key>" \
-  "http://192.168.1.50/api/display?display=clock&tz=-180&date=1&dateint=60"
+  "http://192.168.1.50/api/display?display=clock&tz=America/Sao_Paulo&date=1&dateint=60"
 ```
 
 ### Switch to Game of Life mode
@@ -227,8 +237,9 @@ curl -g -H "X-API-Key: <key>" \
 
 ## Behaviour notes
 
-- **Persistence**: `spd`, `brt`, `mode`, `display`, `tz`, `date`, and `dateint` are saved to NVS and survive reboots, **except** when sent as part of an `alert` request (those are temporary).
+- **Persistence**: `spd`, `brt`, `mode`, `display`, `tz`, `lang`, `date`, `dateint`, and `dateus` are saved to NVS and survive reboots, **except** when sent as part of an `alert` request (those are temporary).
 - **`msg` auto-switches mode**: sending `msg` without an explicit `display=` always switches the device to Message mode. You do not need to send `display=message` explicitly.
 - **Clock requires NTP**: the NTP client only runs in station mode (not in the setup AP). Until the first NTP sync, the clock shows `--:--`.
-- **Timezone granularity**: `tz` accepts any integer in minutes, so half-hour offsets such as UTC+5:30 (`tz=330`) and UTC+9:30 (`tz=570`) are fully supported.
+- **Timezone / DST**: `tz` is an IANA zone name (see `GET /api/timezones`); the device converts it to a POSIX TZ string internally, so zones that observe daylight saving time switch automatically.
+- **Language support**: `lang` is limited to the languages whose weekday abbreviations render correctly on the device's built-in 3×5 font (`en`, `pt`, `de`, `es`, `fr`, `it`).
 - **No rate limit**: requests are handled cooperatively from `loop()`; sending many requests in rapid succession may cause brief display glitches.
